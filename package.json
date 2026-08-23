@@ -343,7 +343,7 @@
   },
   "optionalDependencies": {
     "@atjsh/llmlingua-2": "3.0.0",
-    "better-sqlite3": "^13.0.2",
+    "better-sqlite3": "^13.0.3",
     "js-tiktoken": "^1.0.20",
     "keytar": "^7.9.0",
     "sqlite-vec": "^0.1.9",
