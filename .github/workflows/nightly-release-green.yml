@@ -12,7 +12,12 @@ name: Release-Green (continuous)
 #     captain's direct pushes (sync-back — the one ungated write path) AND the merged
 #     COMBINATION right after every PR merge, attributing the offending push range in
 #     the issue. Base-red MTTD drops from ≤24h to ≤~15min after the offending push.
-#   schedule (3×/day) → full --with-build --full-ci (the deep sweep incl. build+suites).
+#   schedule (3×/day) → --quick (fast HARD gates). The full --with-build --full-ci
+#     deep sweep is workflow_dispatch-only: on hosted runners it never completed
+#     (killed mid-run, exit 143, before it could report), so the scheduled lane runs
+#     the fast gates and the deep sweep stays one manual dispatch away.
+#   no release/v* branch → the release-branch jobs skip quietly (a repo with no
+#     active release branch is a normal state, not a failure).
 #
 # It is NOT a required status check and never touches a contributor PR — it only
 # reports. Ratchet drift (eslint warnings / cognitive-complexity / file-size) is
@@ -35,9 +40,9 @@ on:
       - "package-lock.json"
       - "tsconfig*.json"
   schedule:
-    - cron: "23 5 * * *" # full sweep — off-peak, distinct from other nightlies
-    - cron: "23 12 * * *" # full sweep — midday (WS5.1: 3×/day instead of 1×)
-    - cron: "23 18 * * *" # full sweep — evening
+    - cron: "23 5 * * *" # quick gates — off-peak, distinct from other nightlies
+    - cron: "23 12 * * *" # quick gates — midday (WS5.1: 3×/day instead of 1×)
+    - cron: "23 18 * * *" # quick gates — evening
   workflow_dispatch:
     inputs:
       branch:
@@ -99,16 +104,25 @@ jobs:
               | sort -t/ -k2 -V \
               | tail -1)
           fi
-          if [ -z "$TARGET" ]; then echo "No release/v* branch found"; exit 1; fi
+          if [ -z "$TARGET" ]; then
+            # No active release branch is a NORMAL state (between cycles, or a
+            # repo that has not cut a release branch yet) — not a failure. Skip
+            # the rest of the job quietly instead of failing every scheduled run.
+            echo "::notice::No release/v* branch found — skipping release-branch validation."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Strict format guard — reject anything that isn't release/vX.Y.Z (blocks
           # ref/command injection via the workflow_dispatch input).
           if ! printf '%s' "$TARGET" | grep -qE '^release/v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "Refusing non-canonical branch name: $TARGET"; exit 1
           fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Active release branch: $TARGET"
 
       - name: Checkout the release branch
+        if: ${{ steps.branch.outputs.found == 'true' }}
         env:
           TARGET: ${{ steps.branch.outputs.target }}
         run: |
@@ -117,13 +131,16 @@ jobs:
           git log -1 --oneline
 
       - uses: actions/setup-node@v7
+        if: ${{ steps.branch.outputs.found == 'true' }}
         with:
           node-version: "24"
           cache: npm
 
       - uses: ./.github/actions/npm-ci-retry
+        if: ${{ steps.branch.outputs.found == 'true' }}
 
       - name: Release-green validation (full)
+        if: ${{ steps.branch.outputs.found == 'true' }}
         id: validate
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -132,15 +149,17 @@ jobs:
           # --hermetic: scrub live-test trigger vars (self-hosted runner may carry
           # operator env; hosted ignores the unknown flag before #6300 lands).
           # push → --quick: fast HARD gates only (~5-8min), per-merge signal.
-          # schedule/dispatch → --with-build --full-ci: ALSO run every static gate from
-          # ci.yml's gate jobs (lint, quality-gate, quality-extended, docs-sync-strict,
-          # pr-test-policy) + build + full suites. PRs into release/** only get the
-          # fast-gates, so these accrue silently and explode in layers on the release PR
-          # (v3.8.46: 11 static base-reds leaked).
-          if [ "$EVENT_NAME" = "push" ]; then
-            MODE="--quick"
-          else
+          # schedule → --quick as well: the full sweep cannot complete on hosted
+          # runners (see the main-green note below — killed mid-run, exit 143).
+          # workflow_dispatch → --with-build --full-ci: ALSO run every static gate
+          # from ci.yml's gate jobs (lint, quality-gate, quality-extended,
+          # docs-sync-strict, pr-test-policy) + build + full suites. PRs into
+          # release/** only get the fast-gates, so these accrue silently and
+          # explode in layers on the release PR (v3.8.46: 11 static base-reds leaked).
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             MODE="--with-build --full-ci"
+          else
+            MODE="--quick"
           fi
           echo "[release-green] mode: $MODE (event: $EVENT_NAME)"
           # MODE is an intentional flag list, so word-splitting is wanted here
@@ -152,7 +171,7 @@ jobs:
           cat release-green.log
 
       - name: Open / update tracking issue on HARD failure
-        if: steps.validate.outputs.exit != '0'
+        if: ${{ steps.branch.outputs.found == 'true' && steps.validate.outputs.exit != '0' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.branch.outputs.target }}
@@ -197,7 +216,7 @@ jobs:
           fi
 
       - name: Upload report artifact
-        if: always()
+        if: ${{ always() && steps.branch.outputs.found == 'true' }}
         uses: actions/upload-artifact@v7
         with:
           name: release-green-report
@@ -242,11 +261,20 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           set +e
-          # push (a merge into main) → --quick fast HARD gates; schedule/dispatch → full sweep.
-          if [ "$EVENT_NAME" = "push" ]; then
-            MODE="--quick"
-          else
+          # push (a merge into main) → --quick fast HARD gates.
+          # schedule → --quick too: the full sweep (--with-build --full-ci) never
+          # completed on hosted runners — every scheduled run was killed mid-step
+          # (exit 143 / SIGTERM, ~11-14min in) BEFORE the validator could write
+          # its report, so the tracking-issue and artifact steps below never
+          # fired and the run just showed as failed. The validator's own gate
+          # ceilings (unit 80min, vitest 40min, test-masking 30min, ~15 more
+          # full-ci gates at 10min each) are sized for the self-hosted devbox,
+          # not a hosted runner. The deep sweep stays available on demand via
+          # workflow_dispatch.
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             MODE="--with-build --full-ci"
+          else
+            MODE="--quick"
           fi
           echo "[main-green] mode: $MODE (event: $EVENT_NAME)"
           # MODE is an intentional flag list, so word-splitting is wanted here
@@ -354,16 +382,25 @@ jobs:
               | sort -t/ -k2 -V \
               | tail -1)
           fi
-          if [ -z "$TARGET" ]; then echo "No release/v* branch found"; exit 1; fi
+          if [ -z "$TARGET" ]; then
+            # No active release branch is a NORMAL state (between cycles, or a
+            # repo that has not cut a release branch yet) — not a failure. Skip
+            # the rest of the job quietly instead of failing every scheduled run.
+            echo "::notice::No release/v* branch found — skipping ratchet banking."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Same strict guard as the validation job — blocks ref/command injection
           # through the workflow_dispatch input.
           if ! printf '%s' "$TARGET" | grep -qE '^release/v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "Refusing non-canonical branch name: $TARGET"; exit 1
           fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "bank_branch=chore/bank-ratchet-${TARGET#release/}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout the release branch
+        if: ${{ steps.branch.outputs.found == 'true' }}
         env:
           TARGET: ${{ steps.branch.outputs.target }}
         run: |
@@ -372,13 +409,16 @@ jobs:
           git log -1 --oneline
 
       - uses: actions/setup-node@v7
+        if: ${{ steps.branch.outputs.found == 'true' }}
         with:
           node-version: "24"
           cache: npm
 
       - uses: ./.github/actions/npm-ci-retry
+        if: ${{ steps.branch.outputs.found == 'true' }}
 
       - name: Ratchet the baselines down
+        if: ${{ steps.branch.outputs.found == 'true' }}
         run: |
           # Both --update paths are shrink-only by construction (file-size writes only
           # on `improvements`, complexity-ratchets only when `.improved`), and both exit
@@ -390,6 +430,7 @@ jobs:
           exit 0
 
       - name: Verify the write only went downward
+        if: ${{ steps.branch.outputs.found == 'true' }}
         id: verify
         run: |
           set -euo pipefail
