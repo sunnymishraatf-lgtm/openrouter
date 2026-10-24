@@ -207,11 +207,15 @@ jobs:
           } > issue-body.md
 
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search "in:title $TITLE" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            --search "in:title $TITLE" --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file issue-body.md
             echo "Updated existing issue #$EXISTING"
           else
+            # base-red may not exist on a fresh clone/fork — create it idempotently
+            # (the workflow token has issues: write, which covers label creation)
+            gh label create base-red --repo "$GITHUB_REPOSITORY" \
+              --color d93f0b --description "Base-branch gate failure" 2>/dev/null || true
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --label base-red --body-file issue-body.md
           fi
 
@@ -314,11 +318,15 @@ jobs:
           } > issue-body.md
 
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
-            --search "in:title $TITLE" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            --search "in:title $TITLE" --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
             gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file issue-body.md
             echo "Updated existing issue #$EXISTING"
           else
+            # base-red may not exist on a fresh clone/fork — create it idempotently
+            # (the workflow token has issues: write, which covers label creation)
+            gh label create base-red --repo "$GITHUB_REPOSITORY" \
+              --color d93f0b --description "Base-branch gate failure" 2>/dev/null || true
             gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --label base-red --body-file issue-body.md
           fi
 
@@ -478,7 +486,7 @@ jobs:
           } > pr-body.md
 
           EXISTING=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BANK_BRANCH" \
-            --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
+            --state open --json number --jq '.[0].number // empty' 2>/dev/null || echo "")
           if [ -n "$EXISTING" ]; then
             gh pr edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file pr-body.md
             echo "Updated existing PR #$EXISTING"
